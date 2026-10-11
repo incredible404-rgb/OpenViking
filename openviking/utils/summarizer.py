@@ -6,7 +6,7 @@ Handles summarization and key information extraction.
 """
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from openviking.core.namespace import context_type_for_uri
@@ -41,6 +41,7 @@ class FileRefreshRequest:
     md5: str | None = None
     abstract: str = ""
     vector_action: str = ""
+    ingest_options: IngestOptions = field(default_factory=IngestOptions)
 
     def __post_init__(self) -> None:
         if self.vector_action not in {"", "upsert", "merge"}:
@@ -90,6 +91,7 @@ class Summarizer:
                     md5=file_md5,
                     abstract=file_abstract,
                     vector_action=file_vector_action,
+                    ingest_options=IngestOptions.from_value(ingest_options),
                 ),
             ),
             ctx=ctx,
@@ -208,6 +210,11 @@ class Summarizer:
                     change.file_uri: change.vector_action
                     for change in parent_changes
                     if change.vector_action
+                },
+                file_ingest_options={
+                    change.file_uri: change.ingest_options
+                    for change in parent_changes
+                    if change.ingest_options != IngestOptions()
                 },
             )
             if telemetry_id:

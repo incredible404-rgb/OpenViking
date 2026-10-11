@@ -182,3 +182,35 @@ def test_clear_ingest_options_survive_semantic_message_round_trip():
         search_tag_mode="clear",
         acl_update=update,
     )
+
+
+def test_semantic_msg_round_trips_per_file_ingest_options():
+    uri = "viking://resources/demo/a.md"
+    update = AclUpdate(
+        uri=uri,
+        acl=AclSpec(
+            acl_mode="restricted",
+            entries=[{"principal": "group:engineering", "level": "write"}],
+        ),
+    )
+    msg = SemanticMsg(
+        uri="viking://resources/demo",
+        context_type="resource",
+        file_ingest_options={
+            uri: IngestOptions(
+                search_tags=["team=search"],
+                search_tag_mode="append",
+                acl_update=update,
+            )
+        },
+    )
+
+    restored = SemanticMsg.from_json(msg.to_json())
+
+    assert restored.file_ingest_options == {
+        uri: IngestOptions(
+            search_tags=["team=search"],
+            search_tag_mode="append",
+            acl_update=update,
+        )
+    }

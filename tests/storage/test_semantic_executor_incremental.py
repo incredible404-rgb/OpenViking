@@ -842,6 +842,45 @@ async def test_content_write_tags_apply_only_to_changed_file(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_content_write_uses_per_file_ingest_options(monkeypatch):
+    root_uri = "viking://resources/root"
+    first_uri = f"{root_uri}/a.txt"
+    second_uri = f"{root_uri}/b.txt"
+    fake_fs = _FakeVikingFS(
+        tree={root_uri: [{"name": "a.txt", "isDir": False}, {"name": "b.txt", "isDir": False}]},
+        file_contents={first_uri: "new a", second_uri: "new b"},
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_executor.get_viking_fs", lambda: fake_fs
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_executor.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    processor = _FakeProcessor(fake_fs)
+    first_options = IngestOptions(search_tags=["team=search"])
+    second_options = IngestOptions(search_tags=[], search_tag_mode="clear")
+    executor = SemanticTreeExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER),
+        incremental_update=True,
+        target_uri=root_uri,
+        changes={"modified": [first_uri, second_uri]},
+        generation_trigger="content_write",
+        file_ingest_options={first_uri: first_options, second_uri: second_options},
+    )
+
+    await executor.run(root_uri)
+
+    assert processor.file_ingest_options == {
+        first_uri: first_options,
+        second_uri: second_options,
+    }
+
+
+@pytest.mark.asyncio
 async def test_content_write_with_same_abstract_updates_file_and_parent(monkeypatch):
     root_uri = "viking://resources/root"
     changed_uri = f"{root_uri}/a.txt"

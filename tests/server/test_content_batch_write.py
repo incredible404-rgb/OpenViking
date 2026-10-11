@@ -1,5 +1,7 @@
 import base64
+import hashlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -301,6 +303,164 @@ async def test_batch_resource_files_compile_independent_rnfv_plans(monkeypatch):
         first: "",
         second: "upsert",
     }
+
+
+@pytest.mark.asyncio
+async def test_batch_resource_plan_uses_operation_processing_mode_and_tags(monkeypatch):
+    root = "viking://resources/wiki"
+    uri = f"{root}/a.md"
+    vfs = _VFS(root, {uri: "old"})
+
+    class _VikingDB:
+        async def get_incremental_inventory_by_uris(self, uris, **kwargs):
+            del kwargs
+            return {item: {} for item in uris}
+
+    coordinator = ContentWriteCoordinator(vfs, vikingdb=_VikingDB())
+    seen = {}
+
+    async def build_snapshot(**kwargs):
+        seen["request"] = kwargs["request_intent"]
+        return SimpleNamespace(
+            request=kwargs["request_intent"], vectors=SimpleNamespace(records_by_id={})
+        )
+
+    async def build_plan(**kwargs):
+        del kwargs
+        return None, ContextUpdatePlan(uri, "resource")
+
+    monkeypatch.setattr(content_write_module, "build_rnfv_snapshot", build_snapshot)
+    monkeypatch.setattr(content_write_module, "build_context_update_plan_from_snapshot", build_plan)
+    monkeypatch.setattr(coordinator, "_refresh_batch", AsyncMock(return_value=None))
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {
+                "uri": uri,
+                "content": "new",
+                "mode": "replace",
+                "tags": ["team=search"],
+                "tag_mode": "append",
+            }
+        ],
+        ctx=ctx,
+        wait=False,
+        processing_mode="vectors_only",
+    )
+
+    request = seen["request"]
+    assert request.processing_mode == "vectors_only"
+    assert request.scalar_intents[0].value == ("team=search",)
+    assert request.scalar_intents[0].mode == "append"
+
+
+@pytest.mark.asyncio
+async def test_batch_resource_plan_allows_clear_tags_without_tags(monkeypatch):
+    root = "viking://resources/wiki"
+    uri = f"{root}/a.md"
+    vfs = _VFS(root, {uri: "old"})
+
+    class _VikingDB:
+        async def get_incremental_inventory_by_uris(self, uris, **kwargs):
+            del kwargs
+            return {item: {} for item in uris}
+
+    coordinator = ContentWriteCoordinator(vfs, vikingdb=_VikingDB())
+    seen = {}
+
+    async def build_snapshot(**kwargs):
+        seen["request"] = kwargs["request_intent"]
+        return SimpleNamespace(
+            request=kwargs["request_intent"], vectors=SimpleNamespace(records_by_id={})
+        )
+
+    async def build_plan(**kwargs):
+        del kwargs
+        return None, ContextUpdatePlan(uri, "resource")
+
+    monkeypatch.setattr(content_write_module, "build_rnfv_snapshot", build_snapshot)
+    monkeypatch.setattr(content_write_module, "build_context_update_plan_from_snapshot", build_plan)
+    monkeypatch.setattr(coordinator, "_refresh_batch", AsyncMock(return_value=None))
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    await coordinator.batch_write(
+        root_uri=root,
+        operations=[{"uri": uri, "content": "new", "tag_mode": "clear"}],
+        ctx=ctx,
+        wait=False,
+    )
+
+    assert seen["request"].scalar_intents[0].value == ()
+    # The public ``clear`` spelling reaches RNFV as its backend-compatible
+    # equivalent: replace the scalar field with an empty tag list.
+    assert seen["request"].scalar_intents[0].mode == "replace"
+
+
+@pytest.mark.asyncio
+async def test_batch_applies_operation_acl_and_forwards_file_options(monkeypatch):
+    root = "viking://resources/wiki"
+    uri = f"{root}/a.md"
+    vfs = _VFS(root)
+    prepared_update = object()
+    vfs.prepare_acl_update = AsyncMock(return_value=prepared_update)
+    vfs.acl_manager = SimpleNamespace(apply_indexed_update=AsyncMock())
+    coordinator = ContentWriteCoordinator(vfs)
+    refresh = AsyncMock(return_value=None)
+    monkeypatch.setattr(coordinator, "_refresh_batch", refresh)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {
+                "uri": uri,
+                "content": "new",
+                "tags": ["team=search"],
+                "tag_mode": "append",
+                "acl": {"acl_mode": "restricted", "entries": []},
+            }
+        ],
+        ctx=ctx,
+        wait=False,
+    )
+
+    vfs.prepare_acl_update.assert_awaited_once()
+    vfs.acl_manager.apply_indexed_update.assert_awaited_once_with(prepared_update, ctx)
+    file_options = refresh.await_args.kwargs["file_ingest_options"]
+    assert file_options[uri].search_tags == ["team=search"]
+    assert file_options[uri].search_tag_mode == "append"
+    assert file_options[uri].acl_update is prepared_update
+
+
+@pytest.mark.asyncio
+async def test_batch_same_content_with_tags_is_not_skipped_as_a_conflict_noop(monkeypatch):
+    root = "viking://resources/wiki"
+    uri = f"{root}/a.md"
+    vfs = _VFS(root, {uri: "same"})
+    coordinator = ContentWriteCoordinator(vfs)
+    refresh = AsyncMock(return_value=None)
+    monkeypatch.setattr(coordinator, "_refresh_batch", refresh)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {
+                "uri": uri,
+                "content": "same",
+                "expected_sha256": hashlib.sha256(b"same").hexdigest(),
+                "tags": ["team=search"],
+            }
+        ],
+        ctx=ctx,
+        wait=False,
+        skip_conflicts=True,
+    )
+
+    assert vfs.writes == [uri]
+    assert refresh.await_args.kwargs["file_ingest_options"][uri].search_tags == ["team=search"]
 
 
 @pytest.mark.asyncio

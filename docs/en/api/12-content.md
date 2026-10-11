@@ -348,6 +348,7 @@ Write multiple files below one Resource or Memory directory, then refresh the af
 | `wait` | boolean | No | `true` | Wait for semantic/vector refresh |
 | `timeout` | number | No | `null` | Refresh timeout in seconds when `wait=true` |
 | `telemetry` | boolean/object | No | `false` | Include operation telemetry |
+| `processing_mode` | string | No | `semantic_and_vectors` | One processing mode for the whole batch: `semantic_and_vectors` or `vectors_only` |
 
 Each operation contains:
 
@@ -357,6 +358,9 @@ Each operation contains:
 | `content` | string | Conditional | UTF-8 text; exactly one of `content` and `content_base64` is required |
 | `content_base64` | string | Conditional | Base64-encoded bytes; not supported for Memory targets |
 | `mode` | string | No | `replace` (default), `append`, `create`, or `upsert` |
+| `tags` | string[] | No | - | Explicit retrieval tags for this file |
+| `tag_mode` | string | No | `replace` | Tag write mode for this file: `replace`, `append`, or `clear` |
+| `acl` | object | No | - | Direct ACL for this file; requires manage permission on the file |
 
 **Notes**
 
@@ -364,6 +368,8 @@ Each operation contains:
 - All targets must be files below `root_uri`, use the same context type, and have unique canonical URIs.
 - Resource targets may use any safe file extension; Memory targets retain the text extension allowlist and do not accept binary content.
 - `create`, `replace`, and `upsert` are compatible spellings for setting the requested final body: they overwrite an existing file and create a missing one. `append` appends when the file exists and creates it with the supplied body when it does not.
+- `processing_mode` applies to the whole batch; operations cannot mix semantic modes. `vectors_only` maintains changed-file vectors without refreshing parent semantics.
+- `tags`, `tag_mode`, and `acl` apply per operation. Tags travel with the file's first vector upsert; `clear` does not require `tags` and ignores supplied tag values.
 - The batch acquires exact locks for all target files before validating file state and writing. Writes to disjoint files in the same directory can proceed concurrently; overlapping writes and parent-directory deletion or moves still conflict. Semantic processing starts after all writes finish and the locks are released, refreshing the affected `.overview.md` and `.abstract.md` files together.
 - Resource parent refreshes use the same best-effort behavior as `write()`: L0/L1 lock conflicts skip the directory refresh and its vector updates while preserving file writes and file processing. A later refresh is not guaranteed.
 - An underlying I/O failure can still leave writes completed earlier in the batch visible.

@@ -9,7 +9,7 @@ import binascii
 import hashlib
 import os
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional
 
 from openviking.core.namespace import (
@@ -141,6 +141,7 @@ class _PreparedInlineResource:
     artifact_ref: _InlineArtifactRef
     target: AgfsResourceTarget
     previous_abstract: str = ""
+    ingest_options: IngestOptions = field(default_factory=IngestOptions)
 
 
 def _queue_has_errors(queue_status: Optional[Dict[str, Any]], name: str) -> bool:
@@ -269,6 +270,7 @@ class ContentWriteCoordinator:
         wait: bool = True,
         timeout: Optional[float] = None,
         skip_conflicts: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
         """Write a bundle under one directory, then refresh it as a batch.
 
@@ -283,6 +285,7 @@ class ContentWriteCoordinator:
         Permission, transport and write failures remain errors, not skipped conflicts.
         """
         normalized_root = self._validate_uri_path(root_uri, field_name="root_uri")
+        processing_mode = normalize_processing_mode(processing_mode)
         await self._validate_batch_root(normalized_root, ctx=ctx)
         normalized_operations = await self._normalize_batch_operations(
             normalized_root, operations, ctx=ctx
@@ -306,7 +309,7 @@ class ContentWriteCoordinator:
         refresh_kinds: dict[str, str] = {}
         file_md5s: dict[str, str] = {}
         file_abstracts: dict[str, str] = {}
-        sidecar_directories: set[str] = set()
+        sidecar_directories: dict[str, IngestOptions] = {}
         pending: list[tuple[dict[str, Any], bool, str]] = []
         conflicts: list[dict[str, str]] = []
         prepared_resources: dict[str, _PreparedInlineResource] = {}
@@ -346,7 +349,12 @@ class ContentWriteCoordinator:
                         desired = operation["content"]
                         if isinstance(desired, str):
                             desired = desired.encode("utf-8")
-                        if skip_conflicts and write_mode == "replace" and current == desired:
+                        if (
+                            skip_conflicts
+                            and write_mode == "replace"
+                            and current == desired
+                            and operation["ingest_options"] == IngestOptions()
+                        ):
                             unchanged.append(uri)
                             continue
                 except ConflictError as exc:
@@ -360,6 +368,7 @@ class ContentWriteCoordinator:
                 pending=pending,
                 ctx=ctx,
                 lease=lease,
+                processing_mode=processing_mode,
             )
             file_abstracts = await self._load_file_abstracts(
                 [
@@ -400,6 +409,11 @@ class ContentWriteCoordinator:
                         "skill",
                     } and not is_abstract_overview_uri(uri):
                         file_md5s[uri] = content_md5(final_content)
+                    options = operation["ingest_options"]
+                    if options.acl_update:
+                        await self._viking_fs.acl_manager.apply_indexed_update(
+                            options.acl_update, ctx
+                        )
                 except Exception as exc:
                     write_error = exc
                     break
@@ -408,7 +422,11 @@ class ContentWriteCoordinator:
                     if is_abstract_overview_uri(uri):
                         parent = VikingURI(uri).parent
                         if parent is not None:
-                            sidecar_directories.add(parent.uri)
+                            # Sidecars represent directory L0/L1 records. If
+                            # multiple sidecar writes share a directory, the
+                            # deterministic operation order matches sequential
+                            # write semantics: the last operation's options win.
+                            sidecar_directories[parent.uri] = options
                     elif prepared is None:
                         refresh_kinds[uri] = "modified"
                 else:
@@ -429,19 +447,22 @@ class ContentWriteCoordinator:
                     get_request_wait_tracker().register_request(telemetry_id)
                     request_registered = True
                 try:
-                    for directory_uri in sorted(sidecar_directories):
+                    for directory_uri, options in sorted(sidecar_directories.items()):
                         await self._vectorize_semantic_directory(
-                            directory_uri=directory_uri, ctx=ctx
+                            directory_uri=directory_uri,
+                            ctx=ctx,
+                            ingest_options=options,
                         )
-                    planned_direct_actions = tuple(
-                        action
-                        for prepared in committed_resource_plans
-                        for action in prepared.plan.direct_index_actions
-                    )
-                    direct_index_requested = await enqueue_direct_index_actions(
-                        planned_direct_actions,
-                        ctx=ctx,
-                    )
+                    direct_index_requested = False
+                    for prepared in committed_resource_plans:
+                        direct_index_requested = (
+                            await enqueue_direct_index_actions(
+                                prepared.plan.direct_index_actions,
+                                ctx=ctx,
+                                acl_update=prepared.ingest_options.acl_update,
+                            )
+                            or direct_index_requested
+                        )
                     planned_refreshes = [
                         FileRefreshRequest(
                             file_uri=prepared.plan.file_refresh.file_uri,
@@ -449,6 +470,7 @@ class ContentWriteCoordinator:
                             md5=prepared.plan.file_refresh.md5,
                             abstract=prepared.previous_abstract,
                             vector_action="upsert" if not prepared.existed else "",
+                            ingest_options=prepared.ingest_options,
                         )
                         for prepared in committed_resource_plans
                         if prepared.plan.file_refresh is not None
@@ -475,6 +497,10 @@ class ContentWriteCoordinator:
                             telemetry_id=telemetry_id,
                             file_md5s=file_md5s,
                             file_abstracts=file_abstracts,
+                            file_ingest_options={
+                                operation["uri"]: operation["ingest_options"]
+                                for operation, _, _ in pending
+                            },
                         )
                         if refresh_kinds
                         else None
@@ -660,12 +686,26 @@ class ContentWriteCoordinator:
                 self._validate_create_extension(uri)
             if context_type == "memory" and mode == "append":
                 raise InvalidArgumentError("batch-write append is not supported for memories")
+            tags = raw.get("tags")
+            if tags is not None and (
+                not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags)
+            ):
+                raise InvalidArgumentError(f"batch-write tags must be a string list: {uri}")
+            tag_mode = raw.get("tag_mode", "replace")
+            self._validate_tag_mode(tag_mode)
+            ingest_options = IngestOptions.from_search_tags(tags, mode=tag_mode)
+            if (acl := raw.get("acl")) is not None:
+                ingest_options = replace(
+                    ingest_options,
+                    acl_update=await self._viking_fs.prepare_acl_update(uri, acl, ctx),
+                )
             normalized.append(
                 {
                     "uri": uri,
                     "content": content,
                     "mode": mode,
                     "expected_sha256": raw.get("expected_sha256"),
+                    "ingest_options": ingest_options,
                 }
             )
         return sorted(normalized, key=lambda operation: operation["uri"])
@@ -680,6 +720,7 @@ class ContentWriteCoordinator:
         telemetry_id: str,
         file_md5s: dict[str, str] | None = None,
         file_abstracts: dict[str, str] | None = None,
+        file_ingest_options: dict[str, IngestOptions] | None = None,
     ) -> _BatchRefreshOutcome:
         resource_groups: dict[tuple[str, str], dict[str, list[str]]] = defaultdict(
             lambda: {"added": [], "modified": []}
@@ -714,6 +755,12 @@ class ContentWriteCoordinator:
                     for uri in values
                     if file_abstracts and uri in file_abstracts
                 },
+                file_ingest_options={
+                    uri: options
+                    for values in changes.values()
+                    for uri in values
+                    if file_ingest_options and (options := file_ingest_options.get(uri)) is not None
+                },
             )
             semantic_actions.append(action)
 
@@ -733,6 +780,7 @@ class ContentWriteCoordinator:
                     memory_type=MemoryUpdater.memory_type_from_uri(uri),
                     ctx=ctx,
                     strict=True,
+                    ingest_options=(file_ingest_options or {}).get(uri),
                 )
                 embedding_requested = embedding_requested or requested
 
@@ -768,6 +816,7 @@ class ContentWriteCoordinator:
         ingest_options: IngestOptions | None = None,
         file_md5s: dict[str, str] | None = None,
         file_abstracts: dict[str, str] | None = None,
+        file_ingest_options: dict[str, IngestOptions] | None = None,
     ) -> FreshnessAction:
         changed_entries = len({uri for values in changes.values() for uri in values})
         semantic_config = get_openviking_config().semantic
@@ -824,6 +873,7 @@ class ContentWriteCoordinator:
             aggregate_directory=aggregate_directory,
             file_md5s=file_md5s,
             file_abstracts=file_abstracts,
+            file_ingest_options=file_ingest_options,
         )
         if msg.telemetry_id:
             get_request_wait_tracker().register_semantic_root(msg.telemetry_id, msg.id)
@@ -972,6 +1022,7 @@ class ContentWriteCoordinator:
         pending: list[tuple[dict[str, Any], bool, str]],
         ctx: RequestContext,
         lease: Dict[str, Any],
+        processing_mode: ProcessingMode,
     ) -> dict[str, _PreparedInlineResource]:
         """Compile file-scoped RNFV plans before the first batch F mutation.
 
@@ -999,8 +1050,8 @@ class ContentWriteCoordinator:
         requests = {
             operation["uri"]: RequestIntent.from_ingest_options(
                 target_uri=operation["uri"],
-                processing_mode=DEFAULT_PROCESSING_MODE,
-                ingest_options=None,
+                processing_mode=processing_mode,
+                ingest_options=operation["ingest_options"],
             )
             for operation, _, _ in resource_pending
         }
@@ -1045,7 +1096,7 @@ class ContentWriteCoordinator:
                 request_intent=requests[uri],
                 ctx=ctx,
                 lease=lease,
-                ingest_options=None,
+                ingest_options=operation["ingest_options"],
                 include_previous_abstract=True,
             )
         return prepared
@@ -1134,6 +1185,7 @@ class ContentWriteCoordinator:
             artifact_ref=artifact_ref,
             target=target,
             previous_abstract=previous_abstract,
+            ingest_options=IngestOptions.from_value(ingest_options),
         )
 
     async def _write_direct_with_refresh(

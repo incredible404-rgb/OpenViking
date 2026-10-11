@@ -197,6 +197,7 @@ class SemanticTreeExecutor:
         artifact_files: Optional[List[str]] = None,
         file_abstracts: Optional[Dict[str, str]] = None,
         file_vector_actions: Optional[Dict[str, str]] = None,
+        file_ingest_options: Optional[Dict[str, IngestOptions | Dict[str, Any]]] = None,
         semantic_plan: Optional["SemanticPlan"] = None,
         telemetry_id: str | None = None,
         source_contents: Optional[Mapping[tuple[str, int], str | bytes]] = None,
@@ -257,6 +258,10 @@ class SemanticTreeExecutor:
         self._artifact_files = [path.strip("/") for path in (artifact_files or []) if path]
         self._file_abstracts = dict(file_abstracts or {})
         self._file_vector_actions = dict(file_vector_actions or {})
+        self._file_ingest_options = {
+            uri.rstrip("/"): IngestOptions.from_value(options)
+            for uri, options in (file_ingest_options or {}).items()
+        }
         self._plan_entries_by_uri: Dict[str, "SemanticTreeEntry"] = {}
         self._plan_children: Dict[str, tuple[List[str], List[str]]] = {}
         self._plan_active_dirs: Set[str] = set()
@@ -923,6 +928,10 @@ class SemanticTreeExecutor:
         )
 
     def _ingest_options_for_file(self, file_path: str) -> IngestOptions:
+        if self._generation_trigger == "content_write":
+            options = self._file_ingest_options.get(file_path.rstrip("/"))
+            if options is not None:
+                return options
         if self._generation_trigger == "content_write" and file_path not in self._changed_paths:
             return IngestOptions(acl_update=self._ingest_options.acl_update)
         return self._ingest_options

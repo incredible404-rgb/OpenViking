@@ -348,6 +348,7 @@ ov write viking://resources/docs/api.md \
 | `wait` | boolean | 否 | `true` | 是否等待语义/向量刷新 |
 | `timeout` | number | 否 | `null` | `wait=true` 时的刷新超时时间（秒） |
 | `telemetry` | boolean/object | 否 | `false` | 是否返回操作遥测信息 |
+| `processing_mode` | string | 否 | `semantic_and_vectors` | 整批统一的处理模式：`semantic_and_vectors` 或 `vectors_only` |
 
 每个 operation 包含：
 
@@ -357,6 +358,9 @@ ov write viking://resources/docs/api.md \
 | `content` | string | 条件必填 | UTF-8 文本；与 `content_base64` 必须且只能提供一个 |
 | `content_base64` | string | 条件必填 | Base64 编码的字节；Memory 目标不支持 |
 | `mode` | string | 否 | `replace`（默认）、`append`、`create` 或 `upsert` |
+| `tags` | string[] | 否 | - | 该文件的显式检索标签 |
+| `tag_mode` | string | 否 | `replace` | 该文件标签写入方式：`replace`、`append` 或 `clear` |
+| `acl` | object | 否 | - | 该文件的直接 ACL；需要该文件的 manage 权限 |
 
 **说明**
 
@@ -364,6 +368,8 @@ ov write viking://resources/docs/api.md \
 - 所有目标必须是 `root_uri` 下的文件、属于同一 context type，且 canonical URI 不能重复。
 - Resource 目标允许任意安全文件扩展名；Memory 目标仍使用文本扩展名白名单，且不接受二进制内容。
 - `create`、`replace`、`upsert` 是“写成请求最终正文”的兼容写法：文件存在时覆盖，缺失时创建。`append` 在文件存在时追加，文件缺失时以请求正文创建文件。
+- `processing_mode` 对整个 batch 生效，不能在不同 operation 中混用语义模式；`vectors_only` 不刷新父目录语义，只维护变化文件的向量。
+- `tags`、`tag_mode` 与 `acl` 按 operation 生效；tags 会随该文件首次向量 upsert 写入，`clear` 不要求传 `tags` 并会忽略同时传入的标签值。
 - 整批先获取所有目标文件的精确锁，再校验文件状态并写入；同一目录下不涉及相同文件的写入可以并行，重叠文件的写入或父目录删除、移动仍会冲突。所有文件写完并释放锁后才启动语义处理，统一刷新受影响的 `.overview.md` / `.abstract.md`。
 - 资源父目录刷新与 `write()` 一样采用尽力更新：L0/L1 锁冲突时跳过目录刷新及对应目录向量更新，保留原文和文件自身的处理，不保证自动补刷。
 - 底层 I/O 中途失败时，本批次较早完成的写入仍可能已经可见。

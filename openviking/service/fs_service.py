@@ -1260,6 +1260,7 @@ class FSService:
         wait: bool = True,
         timeout: Optional[float] = None,
         skip_conflicts: bool = False,
+        processing_mode: str = "semantic_and_vectors",
     ) -> Dict[str, Any]:
         """Apply multiple file writes and aggregate downstream refresh."""
         viking_fs = self._ensure_initialized()
@@ -1271,6 +1272,7 @@ class FSService:
             wait=wait,
             timeout=timeout,
             skip_conflicts=skip_conflicts,
+            processing_mode=processing_mode,
         )
 
     async def set_tags(

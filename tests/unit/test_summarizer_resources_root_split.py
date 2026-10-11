@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from openviking.server.identity import RequestContext, Role
+from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.summarizer import FileRefreshRequest, Summarizer
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -261,6 +262,7 @@ async def test_grouped_file_refresh_coalesces_only_direct_parents():
                     created=True,
                     md5="a",
                     vector_action="upsert",
+                    ingest_options=IngestOptions(search_tags=["team=search"]),
                 ),
                 FileRefreshRequest("viking://resources/docs/b.md", md5="b"),
                 FileRefreshRequest("viking://resources/src/main.py", md5="c"),
@@ -285,6 +287,9 @@ async def test_grouped_file_refresh_coalesces_only_direct_parents():
     }
     assert messages["viking://resources/docs"].file_vector_actions == {
         "viking://resources/docs/a.md": "upsert"
+    }
+    assert messages["viking://resources/docs"].file_ingest_options == {
+        "viking://resources/docs/a.md": IngestOptions(search_tags=["team=search"])
     }
     assert messages["viking://resources/src"].changes == {
         "modified": ["viking://resources/src/main.py"]
