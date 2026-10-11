@@ -26,10 +26,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Mapping, Tuple
+from typing import Any, Dict, Literal, Mapping, Tuple
 
 from openviking.concurrency import bounded_map
 from openviking.storage.internal_names import is_storage_internal_name
@@ -45,9 +46,34 @@ from openviking.storage.resource_rnfv import (
     VectorRecordSnapshot,
     canonical_vector_records_by_level,
 )
+from openviking.utils.content_hash import content_md5
 from openviking.utils.log_correlation import log_correlation
 
 logger = logging.getLogger(__name__)
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer knob without letting a bad env break ingestion."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %d", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using %d", name, raw, default)
+        return default
+    return value
+
+
+# add_resources can legitimately ingest a large repository. This bounds the
+# aggregate F-derived URI inventory, not the size of a single VikingDB request.
+RNFV_INVENTORY_LIMIT = _positive_int_env("RNFV_INVENTORY_LIMIT", 1_000_000)
+# Exact filters remain deliberately bounded so their URI list and response do
+# not create one oversized RPC. The backend makes one scalar query per chunk.
+RNFV_INVENTORY_QUERY_BATCH_SIZE = _positive_int_env("RNFV_INVENTORY_QUERY_BATCH_SIZE", 1_000)
 
 
 class ContentState(str, Enum):
@@ -136,6 +162,34 @@ class ArtifactInventory:
     entries: Mapping[str, NewEntry]
     artifact_paths: Mapping[str, str]
     rewritten_paths: frozenset[str] = frozenset()
+
+
+class InlineBytesStore:
+    """Minimal parse-output store backed by a single file's final bytes.
+
+    The single-file write path has no parse artifact; it already holds the
+    fully rendered bytes. This store lets the shared RNFV plan pipeline read the
+    same bytes for body fallbacks and content commit without inventing a real
+    artifact backend. The ref is an opaque placeholder; only ``read_bytes`` is
+    exercised.
+    """
+
+    backend = "inline"
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def read_bytes(self, ref: Any, rel_path: str) -> bytes:
+        del ref, rel_path
+        return self._data
+
+
+def make_inline_file_inventory(final_bytes: bytes) -> ArtifactInventory:
+    """Build a single-file N snapshot from already-rendered bytes."""
+    return ArtifactInventory(
+        entries={"": NewEntry(md5=content_md5(final_bytes), is_dir=False)},
+        artifact_paths={"": ""},
+    )
 
 
 def count_tree_entry_kinds(
@@ -544,9 +598,31 @@ async def build_rnfv_snapshot(
     request_intent: RequestIntent | None = None,
     root_is_file: bool = False,
     target_preexisting: bool = True,
+    formal_snapshot: tuple[Dict[str, FormalEntry], bool] | None = None,
     artifact_inventory: ArtifactInventory | None = None,
+    vector_scope: Literal["subtree", "self"] = "subtree",
+    vector_inventory: Mapping[str, Mapping[str, Any]] | None = None,
+    vector_inventory_strategy: Literal["subtree", "formal"] = "subtree",
+    inventory_limit: int = RNFV_INVENTORY_LIMIT,
+    inventory_query_batch_size: int = RNFV_INVENTORY_QUERY_BATCH_SIZE,
 ) -> RNFVSnapshot:
-    """Read the complete R/N/F/V inputs without deriving an executable plan."""
+    """Read the complete R/N/F/V inputs without deriving an executable plan.
+
+    ``vector_scope="self"`` restricts the subtree-strategy V read to the target URI itself
+    (all levels), which the single-file write path uses so an incremental
+    update never reads sibling records under a shared parent directory.
+
+    The opt-in ``vector_inventory_strategy="formal"`` path is for directory
+    add_resources: it derives V query URIs from F after the formal snapshot is
+    available. V-only records are maintenance debt handled by reindex/prune,
+    not content facts for this ingestion transaction.
+    """
+    if vector_inventory_strategy not in {"subtree", "formal"}:
+        raise ValueError(f"unsupported RNFV vector inventory strategy: {vector_inventory_strategy}")
+    if inventory_limit <= 0:
+        raise ValueError("RNFV inventory limit must be positive")
+    if inventory_query_batch_size <= 0:
+        raise ValueError("RNFV inventory query batch size must be positive")
     request = request_intent or RequestIntent(
         target_uri=target_uri, processing_mode="semantic_and_vectors"
     )
@@ -557,6 +633,8 @@ async def build_rnfv_snapshot(
         )
 
     async def read_formal() -> tuple[Dict[str, FormalEntry], bool]:
+        if formal_snapshot is not None:
+            return formal_snapshot
         if not target_preexisting:
             return {}, True
         return await read_target_file_snapshot(
@@ -571,11 +649,15 @@ async def build_rnfv_snapshot(
         asyncio.create_task(read_artifact()),
         asyncio.create_task(read_formal()),
     ]
-    if request.vectorize:
+    if request.vectorize and vector_inventory is None and vector_inventory_strategy == "subtree":
         tasks.append(
             asyncio.create_task(
                 _read_incremental_vector_inventory(
-                    vikingdb, target_uri=target_uri, ctx=ctx, projection=projection
+                    vikingdb,
+                    target_uri=target_uri,
+                    ctx=ctx,
+                    projection=projection,
+                    vector_scope=vector_scope,
                 )
             )
         )
@@ -588,7 +670,23 @@ async def build_rnfv_snapshot(
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     artifact, formal = results[:2]
-    inventory = results[2] if request.vectorize else {}
+    if not request.vectorize:
+        inventory: Dict[str, Dict[str, Any]] = {}
+    elif vector_inventory is not None:
+        inventory = dict(vector_inventory)
+    elif vector_inventory_strategy == "formal":
+        inventory = await _read_formal_incremental_vector_inventory(
+            vikingdb,
+            target_uri=target_uri,
+            formal_entries=formal[0],
+            target_preexisting=target_preexisting,
+            ctx=ctx,
+            projection=projection,
+            inventory_limit=inventory_limit,
+            query_batch_size=inventory_query_batch_size,
+        )
+    else:
+        inventory = results[2]
     target_files, files_complete = formal
     base = target_uri.rstrip("/")
     prefix = base + "/"
@@ -626,21 +724,84 @@ async def _read_incremental_vector_inventory(
     target_uri: str,
     ctx: Any,
     projection: frozenset[str],
+    vector_scope: Literal["subtree", "self"] = "subtree",
 ) -> Dict[str, Dict[str, Any]]:
     """Read the lightweight V snapshot used to build RNFV."""
     return await vikingdb.get_incremental_inventory_under_uri(
-        target_uri, ctx=ctx, output_fields=sorted(projection)
+        target_uri,
+        ctx=ctx,
+        output_fields=sorted(projection),
+        # The shared inventory API expresses an exact URI as a non-recursive
+        # scope without direct children. Keep its richer recursive/direct-child
+        # contract instead of adding a parallel depth parameter solely for the
+        # single-file write path.
+        recursive=vector_scope == "subtree",
+        include_direct_children=False,
     )
+
+
+async def _read_formal_incremental_vector_inventory(
+    vikingdb: Any,
+    *,
+    target_uri: str,
+    formal_entries: Mapping[str, FormalEntry],
+    target_preexisting: bool,
+    ctx: Any,
+    projection: frozenset[str],
+    inventory_limit: int,
+    query_batch_size: int,
+) -> Dict[str, Dict[str, Any]]:
+    """Read V only for nodes currently present in F.
+
+    An explicit add_resources write to a missing formal target treats any V
+    record as stale. Avoiding that query is both cheaper and ensures old
+    scalar/vector state is not inherited into the new resource.
+    """
+    if not target_preexisting:
+        return {}
+
+    base = target_uri.rstrip("/")
+    uris = [base]
+    uris.extend(
+        base if not relative_path.strip("/") else f"{base}/{relative_path.strip('/')}"
+        for relative_path in formal_entries
+    )
+    exact_uris = list(dict.fromkeys(uris))
+    if len(exact_uris) > inventory_limit:
+        raise ValueError(
+            f"RNFV inventory limit {inventory_limit} exceeded for {base}: "
+            f"{len(exact_uris)} formal URI(s)"
+        )
+
+    records_by_uri = await vikingdb.get_incremental_inventory_by_uris(
+        exact_uris,
+        ctx=ctx,
+        batch_size=query_batch_size,
+        output_fields=sorted(projection),
+    )
+    records: Dict[str, Dict[str, Any]] = {}
+    for uri_records in records_by_uri.values():
+        for record_id, record in uri_records.items():
+            if record_id in records:
+                raise RuntimeError(
+                    f"Formal RNFV inventory returned duplicate record id: {record_id}"
+                )
+            records[record_id] = dict(record)
+    return records
 
 
 __all__ = [
     "ArtifactInventory",
     "ContentState",
     "IndexState",
+    "InlineBytesStore",
     "ResourceDiffEntry",
     "ResourceDiffResult",
     "build_rnfv_snapshot",
     "count_tree_entry_kinds",
+    "make_inline_file_inventory",
     "prepare_artifact_inventory",
     "read_target_file_snapshot",
+    "RNFV_INVENTORY_LIMIT",
+    "RNFV_INVENTORY_QUERY_BATCH_SIZE",
 ]
