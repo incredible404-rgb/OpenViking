@@ -1075,17 +1075,19 @@ async def test_vectorize_content_only_reads_embedding_input(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "content, expected",
+    "content, expected, expected_tokens",
     [
-        ("a" * 200, "a" * 48 + EMBEDDING_TRUNCATION_SUFFIX),
-        ("中文あ가Ｌ、" * 100, "中文あ가Ｌ、" * 2 + "中文あ" + EMBEDDING_TRUNCATION_SUFFIX),
-        ("1234567890" * 100, "1234567890" * 4 + "12345678" + EMBEDDING_TRUNCATION_SUFFIX),
-        ("👍" * 100, "👍" * 48 + EMBEDDING_TRUNCATION_SUFFIX),
-        ("中" * 13, "中" * 13),
+        ("a" * 200, "a" * 48 + EMBEDDING_TRUNCATION_SUFFIX, 20),
+        ("中文あ가Ｌ、" * 100, "中文あ가Ｌ、" * 2 + "中文あ" + EMBEDDING_TRUNCATION_SUFFIX, 20),
+        ("1234567890" * 100, "1234567890" * 2 + "1234" + EMBEDDING_TRUNCATION_SUFFIX, 20),
+        ("👍" * 11, "👍" * 6 + EMBEDDING_TRUNCATION_SUFFIX, 20),
+        ("a1中👍" * 5, "a1中👍" * 5, 19),
     ],
     ids=["ascii", "wide-text", "digits", "emoji", "within-budget"],
 )
-async def test_vectorize_file_bounds_content_before_enqueue(monkeypatch, content, expected):
+async def test_vectorize_file_bounds_content_before_enqueue(
+    monkeypatch, content, expected, expected_tokens
+):
     queue = DummyQueue()
     fs = DummyFS(content)
     monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
@@ -1107,7 +1109,7 @@ async def test_vectorize_file_bounds_content_before_enqueue(monkeypatch, content
     assert len(queue.items) == 1
     message = queue.items[0].message
     assert message == expected
-    assert estimate_embedding_input_tokens(message) <= 20
+    assert estimate_embedding_input_tokens(message) == expected_tokens
     # Provider preparation must not truncate an already bounded queue payload again.
     assert truncate_embedding_input(message, 20) == message
     assert fs.read_file_calls == 1
