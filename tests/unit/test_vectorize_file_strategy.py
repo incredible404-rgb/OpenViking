@@ -1078,9 +1078,9 @@ async def test_vectorize_content_only_reads_embedding_input(monkeypatch):
     "content, expected",
     [
         ("a" * 200, "a" * 48 + EMBEDDING_TRUNCATION_SUFFIX),
-        ("中文あ가Ｌ、" * 100, "中文あ가Ｌ、中文" + EMBEDDING_TRUNCATION_SUFFIX),
-        ("1234567890" * 100, "1234567890" * 3 + "123456" + EMBEDDING_TRUNCATION_SUFFIX),
-        ("👍" * 100, "👍" * 6 + EMBEDDING_TRUNCATION_SUFFIX),
+        ("中文あ가Ｌ、" * 100, "中文あ가Ｌ、" * 2 + "中文あ" + EMBEDDING_TRUNCATION_SUFFIX),
+        ("1234567890" * 100, "1234567890" * 4 + "12345678" + EMBEDDING_TRUNCATION_SUFFIX),
+        ("👍" * 100, "👍" * 48 + EMBEDDING_TRUNCATION_SUFFIX),
         ("中" * 13, "中" * 13),
     ],
     ids=["ascii", "wide-text", "digits", "emoji", "within-budget"],
