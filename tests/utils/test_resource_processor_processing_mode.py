@@ -320,7 +320,7 @@ async def test_local_incremental_noop_skips_semantic_queue_and_releases_resource
 
 
 @pytest.mark.asyncio
-async def test_add_resources_rnfv_uses_formal_inventory_strategy(monkeypatch, ctx):
+async def test_add_resources_rnfv_uses_subtree_inventory_to_delete_orphans(monkeypatch, ctx):
     from openviking.storage.resource_diff import ArtifactInventory
     from openviking.storage.resource_rnfv import (
         FormalTreeSnapshot,
@@ -388,9 +388,11 @@ async def test_add_resources_rnfv_uses_formal_inventory_strategy(monkeypatch, ct
     )
 
     assert result == {"status": "success"}
-    assert captured["vector_inventory_strategy"] == "formal"
-    assert captured["inventory_limit"] == 1_000_000
-    assert captured["inventory_query_batch_size"] == 1_000
+    # V must be read for the whole target subtree. Otherwise a V-only URI is
+    # invisible to RNFV and cannot reach the existing ABSENT -> DELETE branch.
+    assert captured.get("vector_inventory_strategy", "subtree") == "subtree"
+    assert "inventory_limit" not in captured
+    assert "inventory_query_batch_size" not in captured
 
 
 @pytest.mark.asyncio
